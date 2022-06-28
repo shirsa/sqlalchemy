@@ -170,6 +170,11 @@ class AsyncSession(ReversibleProxy[Session]):
             self.sync_session_class(bind=sync_bind, binds=sync_binds, **kw)
         )
 
+        # These fields are used to synchronize concurrent 'merge' and 'autoflush' operations
+        self._concurrent_async_merge_tasks = 0
+        self._orig_autoflush = self.sync_session.autoflush
+        self._async_merge_lock = Lock()
+
     sync_session_class: Type[Session] = Session
     """The class or callable that provides the
     underlying :class:`_orm.Session` instance for a particular
@@ -612,9 +617,29 @@ class AsyncSession(ReversibleProxy[Session]):
             :meth:`_orm.Session.merge` - main documentation for merge
 
         """
-        return await greenlet_spawn(
+        # Hold the lock to prevent other potential async merges to call autoflush
+        async with self._async_merge_lock:
+            if self._concurrent_async_merge_tasks == 0:
+                # This is the only async merge that is currently executed,
+                # call autoflush if needed and disable it for now
+                if load:
+                    await greenlet_spawn(self.sync_session._autoflush)
+                self._orig_autoflush = self.sync_session.autoflush
+                self.sync_session.autoflush = False
+
+            self._concurrent_async_merge_tasks += 1
+
+        res = await greenlet_spawn(
             self.sync_session.merge, instance, load=load, options=options
         )
+
+        async with self._async_merge_lock:
+            self._concurrent_async_merge_tasks -= 1
+            if self._concurrent_async_merge_tasks == 0:
+                # Restore autoflush when last merge task finishes
+                self.sync_session.autoflush = self._orig_autoflush
+
+        return res
 
     async def flush(self, objects: Optional[Sequence[Any]] = None) -> None:
         """Flush all the object changes to the database.
